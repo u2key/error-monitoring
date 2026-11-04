@@ -14,12 +14,22 @@ in a new directory under [output] dir:
     counters.csv   the detector's per-address counters, dumped at the end
                    (counters_history.csv: the periodic dumps, if enabled)
     per_bit.csv    errors per TMRDFF bit, from the events
-    summary.csv    test time, active time, downtime, totals
+    summary.csv    test time, active time, downtime, totals, and the flip-flop
+                   error estimate corrected for what the scan can see
+
+Correction: a voting triplicated flip-flop repairs an upset at the next clock,
+so an upset is visible for one cycle, and the scan looks at a given bit for 2
+of the num_addr * (settle + 4) cycles of a sweep. Observed flip-flop errors are
+therefore a sample of the upsets with that probability; the estimate divides by
+it. It assumes upsets last one cycle and fall uniformly over the scan, and it
+is statistical: with few observed errors its uncertainty is large (the 95 %
+limits in summary.csv), and with none it only gives an upper limit.
 """
 import argparse
 import configparser
 import csv
 import datetime
+import math
 import os
 import shlex
 import subprocess
@@ -32,6 +42,18 @@ from em_layout import Layout
 
 class DetectorError(Exception):
     pass
+
+
+def visibility(num_addr, settle):
+    """Probability that the scan sees a one-cycle flip of a given bit."""
+    return 2.0 / (num_addr * (settle + 4))
+
+
+def poisson_limits(n):
+    """Approximate 95 % limits of a Poisson mean, given n observed (Wilson-Hilferty)."""
+    lo = 0.0 if n == 0 else n * (1 - 1 / (9 * n) - 1.96 / (3 * math.sqrt(n))) ** 3
+    m = n + 1
+    return lo, m * (1 - 1 / (9 * m) + 1.96 / (3 * math.sqrt(m))) ** 3
 
 
 class Monitor:
@@ -269,12 +291,17 @@ class Monitor:
             w.writerow([a, a * lanes, a * lanes + lanes - 1,
                         " ".join(self.layout.registers_in(a, lanes)), s, c])
         f.close()
-        f, w = self.open_csv("per_bit.csv", ["bit", "address", "lane", "register", "soft", "config"])
+        vis = visibility(self.info.num_addr, self.info.settle)
+        f, w = self.open_csv("per_bit.csv", ["bit", "address", "lane", "register", "soft", "config",
+                                             "soft_estimated"])
         for bit in sorted(self.per_bit):
             s, c = self.per_bit[bit]
-            w.writerow([bit, bit // lanes, bit % lanes, self.layout.describe(bit), s, c])
+            w.writerow([bit, bit // lanes, bit % lanes, self.layout.describe(bit), s, c, round(s / vis, 1)])
         f.close()
         wall = end - self.t0
+        active = wall - self.downtime
+        observed = self.totals["soft_bits"]
+        low, high = poisson_limits(observed)
         hw_soft = sum(s for _, s, _ in counters)
         hw_cfg = sum(c for _, _, c in counters)
         f, w = self.open_csv("summary.csv", ["item", "value"])
@@ -291,6 +318,11 @@ class Monitor:
                      ("reconfigs", self.totals["reconfigs"]),
                      ("reconfig_failures", self.totals["reconfig_failures"]),
                      ("hw_soft_count", hw_soft), ("hw_config_count", hw_cfg),
+                     ("soft_visibility", f"{vis:.6g}"),
+                     ("soft_estimated", round(observed / vis, 1)),
+                     ("soft_estimated_low95", round(low / vis, 1)),
+                     ("soft_estimated_high95", round(high / vis, 1)),
+                     ("soft_estimated_per_s", f"{observed / vis / active:.6g}" if active > 0 else ""),
                      ("fifo_overflow", int(self.overflow)),
                      ("frame_errors", self.reader.bad)]:
             w.writerow([k, v])

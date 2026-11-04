@@ -11,7 +11,7 @@ import unittest
 
 import em_protocol as P
 from em_layout import Layout
-from em_host import Monitor
+from em_host import Monitor, visibility, poisson_limits
 
 LANES, NUM_ADDR, ADDR_W = 8, 5, 3
 
@@ -103,6 +103,15 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(ev.replicas(2, 0), "B")
 
 
+class CorrectionTest(unittest.TestCase):
+    def test_limits(self):
+        # exact Poisson 95 % limits: n=0 (0, 3.69), n=10 (4.80, 18.39)
+        self.assertEqual(poisson_limits(0)[0], 0.0)
+        self.assertAlmostEqual(poisson_limits(0)[1], 3.69, delta=0.1)
+        self.assertAlmostEqual(poisson_limits(10)[0], 4.80, delta=0.1)
+        self.assertAlmostEqual(poisson_limits(10)[1], 18.39, delta=0.1)
+
+
 class LayoutTest(unittest.TestCase):
     def test_map(self):
         with tempfile.NamedTemporaryFile("w", suffix=".map", delete=False) as f:
@@ -155,7 +164,13 @@ class MonitorTest(unittest.TestCase):
         summ = {r["item"]: r["value"] for r in read_csv(os.path.join(out, "summary.csv"))}
         self.assertEqual((summ["soft_bits"], summ["config_errors"], summ["reconfigs"]), ("2", "1", "1"))
         self.assertEqual((summ["hw_soft_count"], summ["hw_config_count"]), ("2", "1"))
+        vis = visibility(NUM_ADDR, 8)                        # 2 of 5 * 12 cycles
+        self.assertAlmostEqual(vis, 2 / 60)
+        self.assertEqual(float(summ["soft_estimated"]), 60.0)   # 2 observed / vis
+        self.assertLess(float(summ["soft_estimated_low95"]), 60.0)
+        self.assertGreater(float(summ["soft_estimated_high95"]), 60.0)
         pb = read_csv(os.path.join(out, "per_bit.csv"))
+        self.assertEqual(float(pb[0]["soft_estimated"]), 30.0)
         self.assertEqual([(r["bit"], r["soft"], r["config"]) for r in pb],
                          [("17", "1", "0"), ("28", "0", "1"), ("32", "1", "0")])
 

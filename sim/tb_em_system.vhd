@@ -19,12 +19,14 @@
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
+use ieee.math_real.all;
 use work.em_pkg.all;
 
 entity tb_em_system is
   generic (
     HOLD_LO : natural := 17;          -- TMRDFF bit of HOLD(0), from the map
-    DEBUG   : boolean := false        -- report every frame received
+    DEBUG   : boolean := false;       -- report every frame received
+    RANDOM_FLIPS : positive := 1500
   );
 end tb_em_system;
 
@@ -61,8 +63,8 @@ architecture tb of tb_em_system is
 
   -- frames received by the host model
   type bytes_t is array (0 to 31) of std_logic_vector(7 downto 0);
-  type frames_t is array (0 to 255) of bytes_t;
-  type ints_t is array (0 to 255) of natural;
+  type frames_t is array (0 to 1023) of bytes_t;
+  type ints_t is array (0 to 1023) of natural;
   signal f_type : ints_t := (others => 0);
   signal f_len : ints_t := (others => 0);
   signal f_pay : frames_t;
@@ -215,7 +217,7 @@ begin
         wait on n_frames for deadline - now;
         if now >= deadline then
           fail("no frame of type " & integer'image(to_integer(unsigned(t))));
-          idx := 255;
+          idx := 1023;
           return;
         end if;
       end loop;
@@ -261,6 +263,9 @@ begin
     end procedure;
 
     variable idx, from : natural;
+    variable seed1 : positive := 11;
+    variable seed2 : positive := 73;
+    variable r : real;
     variable lane_bit : std_logic_vector(7 downto 0);
   begin
     lane_bit := (others => '0');
@@ -273,7 +278,7 @@ begin
     -- 1. INFO, CLEAR, START
     send(CMD_INFO);
     expect(FT_INFO, idx);
-    if idx < 255 then
+    if idx < 1023 then
       if u16(f_pay(idx)(1), f_pay(idx)(2)) /= LANES or
          to_integer(unsigned(f_pay(idx)(7))) /= NUM_ADDR then
         fail("INFO contents");
@@ -325,18 +330,44 @@ begin
       fail("no one-cycle flip was seen");
     end if;
 
+    -- 2b. the correction factor: one-cycle flips at random times are seen with
+    -- probability 2 / (NUM_ADDR * (SETTLE + 4)), which host/em_host.py divides by
+    from := n_frames;
+    for k in 1 to RANDOM_FLIPS loop
+      uniform(seed1, seed2, r);
+      for i in 1 to 61 + integer(trunc(r * 120.0)) loop
+        wait until rising_edge(dclk);
+      end loop;
+      wait for 1 ns;
+      hold(0) <= force not hold(0);
+      wait until rising_edge(dclk);
+      wait for 1 ns;
+      hold(0) <= release;
+    end loop;
+    wait for 100 us;
+    report "random flips: " & integer'image(RANDOM_FLIPS) & " injected, "
+           & integer'image(count(FT_SOFT, from)) & " seen, expected "
+           & integer'image(RANDOM_FLIPS * 2 / (NUM_ADDR * (SETTLE + 4)));
+    if abs (real(count(FT_SOFT, from)) - real(RANDOM_FLIPS) * 2.0 / real(NUM_ADDR * (SETTLE + 4)))
+       > 4.0 * sqrt(real(RANDOM_FLIPS) * 2.0 / real(NUM_ADDR * (SETTLE + 4))) then
+      fail("detection rate does not match the correction factor");
+    end if;
+    if count(FT_CONFIG, from) /= 0 then
+      fail("a random one-cycle flip was taken for a configuration error");
+    end if;
+
     -- 3. a flip that stays: configuration error, halt, resume
     from := n_frames;
     hold(0) <= force not hold(0);
     expect(FT_CONFIG, idx, 200 us);
-    if idx < 255 then
+    if idx < 1023 then
       if ev_addr(idx) /= T_ADDR or ev_mask(idx, 0) /= lane_bit or ev_mask(idx, 3) /= lane_bit then
         fail("configuration error place");
       end if;
     end if;
     send(CMD_STATUS);
     expect(FT_STATUS, idx);
-    if idx < 255 and f_pay(idx)(0)(1) /= '1' then
+    if idx < 1023 and f_pay(idx)(0)(1) /= '1' then
       fail("not halted after a configuration error");
     end if;
     wait for 5 us;
@@ -388,12 +419,12 @@ begin
     from := n_frames;
     dclk_run <= false;
     expect(FT_CLOCK, idx, 100 us);
-    if idx < 255 and f_pay(idx)(0) /= x"00" then
+    if idx < 1023 and f_pay(idx)(0) /= x"00" then
       fail("clock loss not reported");
     end if;
     dclk_run <= true;
     expect(FT_CLOCK, idx, 100 us);
-    if idx < 255 and f_pay(idx)(0) /= x"01" then
+    if idx < 1023 and f_pay(idx)(0) /= x"01" then
       fail("clock return not reported");
     end if;
 
