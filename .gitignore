@@ -1,0 +1,7 @@
+sim/work/
+__pycache__/
+host/config.ini
+host/results/
+results/
+*.wlf
+transcript
