@@ -20,8 +20,10 @@ package em_pkg is
   constant FT_DUMPEND : std_logic_vector(7 downto 0) := x"06";
   constant FT_ACK     : std_logic_vector(7 downto 0) := x"07";
   constant FT_INFO    : std_logic_vector(7 downto 0) := x"08";
-  constant FT_CLOCK   : std_logic_vector(7 downto 0) := x"09";  -- DUT clock lost / back
+  constant FT_LINK    : std_logic_vector(7 downto 0) := x"09";  -- readout link lost / back
   constant FT_CLEARED : std_logic_vector(7 downto 0) := x"0A";
+  constant FT_TRAIN   : std_logic_vector(7 downto 0) := x"0B";  -- one training run's result
+  constant FT_NACK    : std_logic_vector(7 downto 0) := x"0C";  -- refused while running
 
   -- command bytes
   constant CMD_START  : std_logic_vector(7 downto 0) := x"53";  -- 'S'
@@ -31,15 +33,22 @@ package em_pkg is
   constant CMD_DUMP   : std_logic_vector(7 downto 0) := x"44";  -- 'D'
   constant CMD_INFO   : std_logic_vector(7 downto 0) := x"49";  -- 'I'
   constant CMD_STATUS : std_logic_vector(7 downto 0) := x"3F";  -- '?'
+  constant CMD_TRAIN  : std_logic_vector(7 downto 0) := x"54";  -- 'T' one training run
+  constant CMD_RATIO  : std_logic_vector(7 downto 0) := x"46";  -- 'F' + 3 bytes
+  constant CMD_LAT    : std_logic_vector(7 downto 0) := x"4C";  -- 'L' + 1 byte
+  constant CMD_TAP    : std_logic_vector(7 downto 0) := x"41";  -- 'A' + line + tap
+  constant CMD_MODE   : std_logic_vector(7 downto 0) := x"4D";  -- 'M' + 0 sweep / 1 list
+  constant CMD_LIST   : std_logic_vector(7 downto 0) := x"55";  -- 'U' + count(2) + addresses
 
   constant SOFT_CNT_W : positive := 16;   -- per-address flip-flop error counter
   constant CFG_CNT_W  : positive := 8;    -- per-address configuration error counter
-  constant VERSION    : natural := 1;
+  constant VERSION    : natural := 2;
 
   function clog2(n : positive) return natural;
   function nbytes(bits : positive) return positive;
   function popcount(v : std_logic_vector) return natural;
   function majority(a, b, c : std_logic_vector) return std_logic_vector;
+  function parity(v : std_logic_vector) return std_logic;
 end em_pkg;
 
 package body em_pkg is
@@ -68,6 +77,15 @@ package body em_pkg is
       end if;
     end loop;
     return n;
+  end function;
+
+  function parity(v : std_logic_vector) return std_logic is
+    variable p : std_logic := '0';
+  begin
+    for i in v'range loop
+      p := p xor v(i);
+    end loop;
+    return p;
   end function;
 
   -- the voter's expression, bit by bit

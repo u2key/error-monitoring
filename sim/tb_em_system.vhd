@@ -1,21 +1,24 @@
--- System testbench: a triplicated design on "FPGA 1" with tmrdff_readout,
--- the detector on "FPGA 2", and the host as a UART bus-functional model.
--- VHDL-2008 (testbench code): external names reach into the design to inject
--- faults.
+-- System testbench: a triplicated design with tmrdff_readout on "FPGA 1", the
+-- tester on "FPGA 2", and the host as a UART bus-functional model. VHDL-2008
+-- (testbench code): external names reach into the design to inject faults.
 --
--- The design is sim/dut/areset.vhd converted with --tmr --light --probe
--- (37 TMRDFF bits); run_sim.sh passes HOLD_LO, the TMRDFF bit of HOLD(0), from
--- the converter's map. Checks:
---   1. INFO, CLEAR, START are answered
---   2. a one-cycle flip of one replica bit, injected at every offset across
---      an address visit, is reported as a flip-flop error at the right address
---      and lane or not seen at all -- never as a configuration error -- and is
---      seen at least once
---   3. a flip held in place is a configuration error: reported at the right
---      place, the scan halts; after "reconfiguration" (release) and RESUME it
---      scans again without errors
---   4. the counter dump agrees with the events received
---   5. stopping the forwarded clock reports CLOCK lost, restarting it back
+-- The design is sim/dut/areset.vhd converted with --tmr --light --probe (37
+-- TMRDFF bits, 10 addresses at 4 lanes); run_sim.sh passes HOLD_LO, the TMRDFF
+-- bit of HOLD(0), from the converter's map. Every lane and echo wire has its own
+-- delay. Checks:
+--   1. INFO; ratio commands (period measured, bad values and running refused)
+--   2. before calibration the echoes reveal the misalignment
+--   3. calibration finds a latency and per-line taps that pass; then a fault-free
+--      scan shows no errors and no bad echoes
+--   4. flips of one replica bit at random times, lasting to the next design edge
+--      (as a voting flip-flop repairs them), are seen at the rate the visibility
+--      formula says, at the right place, and never as configuration errors
+--   5. a flip that stays is a configuration error: right place, scan halts;
+--      released and resumed, the scan is clean again
+--   6. the counter dump agrees with the events
+--   7. list mode reads only the listed addresses, at the formula's rate; a list
+--      of one is the fixed-address mode
+--   8. a dead readout is reported as link lost, and back when it returns
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
@@ -25,58 +28,75 @@ use work.em_pkg.all;
 entity tb_em_system is
   generic (
     HOLD_LO : natural := 17;          -- TMRDFF bit of HOLD(0), from the map
-    DEBUG   : boolean := false;       -- report every frame received
-    RANDOM_FLIPS : positive := 1500
+    RANDOM_FLIPS : positive := 600
   );
 end tb_em_system;
 
 architecture tb of tb_em_system is
   constant WIDTH    : positive := 37;
-  constant LANES    : positive := 8;
-  constant ADDR_W   : positive := 3;
-  constant NUM_ADDR : positive := 5;
-  constant SETTLE   : positive := 8;
+  constant LANES    : positive := 4;
+  constant ADDR_W   : positive := 4;
+  constant NUM_ADDR : positive := 10;
+  constant GUARD    : natural := 1;
+  constant RATIO    : positive := 8;
+  constant TAPS     : positive := 8;
+  constant LMAX     : positive := 16;
+  constant LINES    : positive := 3 * LANES + 3;
   constant CLK_HZ   : positive := 50000000;
   constant BAUD     : positive := 5000000;
   constant BIT_T    : time := 1 sec / BAUD;
+  constant NO_FRAME : natural := 4095;
 
-  signal sys_clk : std_logic := '0';
-  signal dclk : std_logic := '0';
-  signal dclk_run : boolean := true;
+  -- a different delay on every wire, spanning more than half a read period
+  function wire_delay(line : natural) return time is
+  begin
+    return 2 ns + ((line * 7) mod 13) * 1 ns;
+  end function;
+
+  signal read_clk, sample_clk : std_logic := '0';
   signal rst_n : std_logic := '0';
   signal done : boolean := false;
+  signal ro_alive : boolean := true;
+
+  -- tester outputs and the wires to FPGA 1
+  signal t_dclk, t_rclk, w_dclk, w_rclk : std_logic;
+  signal t_addr_a, t_addr_b, t_addr_c, w_addr_a, w_addr_b, w_addr_c : std_logic_vector(ADDR_W - 1 downto 0);
 
   -- FPGA 1
-  signal rst_dut, enb, ta_rst : std_logic := '0';
+  signal rst_dut, enb : std_logic := '0';
   signal din : std_logic_vector(3 downto 0) := (others => '0');
   signal addr : std_logic_vector(1 downto 0) := (others => '0');
   signal tmr_a, tmr_b, tmr_c : std_logic_vector(WIDTH - 1 downto 0);
   signal lane_a, lane_b, lane_c : std_logic_vector(LANES - 1 downto 0);
-  signal clk_fwd : std_logic;
-  -- the board-to-board wires, with some delay
-  signal w_lane_a, w_lane_b, w_lane_c : std_logic_vector(LANES - 1 downto 0);
-  signal w_clk : std_logic;
-  signal det_addr, w_addr : std_logic_vector(ADDR_W - 1 downto 0);
+  signal echo_a, echo_b, echo_c : std_logic;
+
+  -- the wires back, line by line in the tester's order
+  signal lines_out, lines_w : std_logic_vector(LINES - 1 downto 0);
 
   -- host link
   signal h2d, d2h : std_logic := '1';
 
   -- frames received by the host model
   type bytes_t is array (0 to 31) of std_logic_vector(7 downto 0);
-  type frames_t is array (0 to 1023) of bytes_t;
-  type ints_t is array (0 to 1023) of natural;
+  type frames_t is array (0 to NO_FRAME) of bytes_t;
+  type ints_t is array (0 to NO_FRAME) of natural;
   signal f_type : ints_t := (others => 0);
-  signal f_len : ints_t := (others => 0);
   signal f_pay : frames_t;
   signal n_frames : natural := 0;
   signal bad_frames : natural := 0;
 begin
-  sys_clk <= not sys_clk after 10 ns when not done else '0';
-  dclk <= not dclk after 25 ns when dclk_run and not done else dclk;
+  read_clk <= not read_clk after 10 ns when not done else '0';
+  sample_clk <= not sample_clk after 2.5 ns when not done else '0';
 
-  -- FPGA 1: the triplicated design and its readout
+  -- the two clocks travel alike, so reads keep their phase to the design clock
+  w_dclk <= transport t_dclk after 3 ns;
+  w_rclk <= transport t_rclk after 3 ns when ro_alive else '0';
+  w_addr_a <= transport t_addr_a after 3 ns;
+  w_addr_b <= transport t_addr_b after 4 ns;
+  w_addr_c <= transport t_addr_c after 5 ns;
+
   u_dut : entity work.areset
-    port map (clk => dclk,
+    port map (clk => w_dclk,
               rst_n_a => rst_dut, rst_n_b => rst_dut, rst_n_c => rst_dut,
               enb_a => enb, enb_b => enb, enb_c => enb,
               din_a => din, din_b => din, din_c => din,
@@ -90,30 +110,37 @@ begin
               tmrdff_a => tmr_a, tmrdff_b => tmr_b, tmrdff_c => tmr_c);
   u_ro : entity work.tmrdff_readout
     generic map (WIDTH => WIDTH, LANES => LANES, ADDR_WIDTH => ADDR_W)
-    port map (clk => dclk, tmrdff_a => tmr_a, tmrdff_b => tmr_b, tmrdff_c => tmr_c,
-              rd_addr => w_addr, lane_a => lane_a, lane_b => lane_b, lane_c => lane_c,
-              clk_out => clk_fwd);
+    port map (read_clk => w_rclk, tmrdff_a => tmr_a, tmrdff_b => tmr_b, tmrdff_c => tmr_c,
+              addr_a => w_addr_a, addr_b => w_addr_b, addr_c => w_addr_c,
+              lane_a => lane_a, lane_b => lane_b, lane_c => lane_c,
+              echo_a => echo_a, echo_b => echo_b, echo_c => echo_c);
 
-  w_lane_a <= lane_a after 4 ns;
-  w_lane_b <= lane_b after 4 ns;
-  w_lane_c <= lane_c after 4 ns;
-  w_clk <= clk_fwd after 3 ns;
-  w_addr <= det_addr after 4 ns;
+  lines_out <= echo_c & echo_b & echo_a & lane_c & lane_b & lane_a;
+  g_wires : for i in 0 to LINES - 1 generate
+    lines_w(i) <= transport lines_out(i) after wire_delay(i);
+  end generate;
 
-  -- FPGA 2: the detector
   u_det : entity work.em_detector_top
     generic map (CLK_HZ => CLK_HZ, BAUD => BAUD, LANES => LANES, ADDR_WIDTH => ADDR_W,
-                 NUM_ADDR => NUM_ADDR, SETTLE => SETTLE, SWEEP_LOG => 6, FIFO_LOG => 4,
-                 ALIVE_US => 20)
-    port map (sys_clk => sys_clk, rst_n => rst_n, uart_rxd => h2d, uart_txd => d2h,
-              dut_clk => w_clk, dut_lane_a => w_lane_a, dut_lane_b => w_lane_b, dut_lane_c => w_lane_c,
-              dut_addr => det_addr, led_run => open, led_halt => open, led_clock => open);
+                 NUM_ADDR => NUM_ADDR, GUARD => GUARD, WMAX => 16, TAPS => TAPS, LMAX => LMAX,
+                 LIST_BITS => 3, SWEEP_LOG => 8, FIFO_LOG => 6, TRAIN_RUN => 64, LINK_LOG => 8)
+    port map (read_clk => read_clk, sample_clk => sample_clk, rst_n => rst_n,
+              uart_rxd => h2d, uart_txd => d2h,
+              dut_design_clk => t_dclk, dut_read_clk => t_rclk,
+              dut_addr_a => t_addr_a, dut_addr_b => t_addr_b, dut_addr_c => t_addr_c,
+              dut_lane_a => lines_w(LANES - 1 downto 0),
+              dut_lane_b => lines_w(2 * LANES - 1 downto LANES),
+              dut_lane_c => lines_w(3 * LANES - 1 downto 2 * LANES),
+              dut_echo_a => lines_w(3 * LANES),
+              dut_echo_b => lines_w(3 * LANES + 1),
+              dut_echo_c => lines_w(3 * LANES + 2),
+              led_run => open, led_halt => open, led_link => open);
 
   -- the design runs with random inputs all along
-  stim : process(dclk)
+  stim : process(w_dclk)
     variable lfsr : unsigned(15 downto 0) := x"ACE1";
   begin
-    if rising_edge(dclk) then
+    if rising_edge(w_dclk) then
       lfsr := lfsr(14 downto 0) & (lfsr(15) xor lfsr(13) xor lfsr(12) xor lfsr(10));
       enb <= lfsr(0) or lfsr(5);
       din <= std_logic_vector(lfsr(4 downto 1));
@@ -123,9 +150,8 @@ begin
 
   -- host model, receive side: decode frames
   rx : process
-    variable b : std_logic_vector(7 downto 0);
+    variable b, sum : std_logic_vector(7 downto 0);
     variable typ, len : natural;
-    variable sum : std_logic_vector(7 downto 0);
     variable pay : bytes_t;
     procedure getb(variable v : out std_logic_vector(7 downto 0)) is
     begin
@@ -148,13 +174,8 @@ begin
       getb(b);
       if b /= sum then
         bad_frames <= bad_frames + 1;
-      else
-        if DEBUG then
-          report "frame type " & integer'image(typ) & " len " & integer'image(len)
-                 & " b0 " & integer'image(to_integer(unsigned(pay(0))));
-        end if;
+      elsif n_frames < NO_FRAME then
         f_type(n_frames) <= typ;
-        f_len(n_frames) <= len;
         f_pay(n_frames) <= pay;
         n_frames <= n_frames + 1;
       end if;
@@ -163,27 +184,24 @@ begin
     end if;
   end process;
 
-  dbg : process
-    alias ev_we is << signal .tb_em_system.u_det.ev_we : std_logic >>;
-    alias ev_d is << signal .tb_em_system.u_det.ev_wdata : std_logic_vector(8 + ADDR_W + 32 + 6 * LANES - 1 downto 0) >>;
-    alias ev_full is << signal .tb_em_system.u_det.ev_full : std_logic >>;
-  begin
-    wait until rising_edge(w_clk);
-    if DEBUG and ev_we = '1' then
-      report "FIFO write type " & integer'image(to_integer(unsigned(ev_d(ev_d'left downto ev_d'left - 7))))
-             & " full=" & std_logic'image(ev_full);
-    end if;
-  end process;
-
   main : process
     alias hold is << signal .tb_em_system.u_dut.hold_a : std_logic_vector(3 downto 0) >>;
-    alias ro_addr is << signal .tb_em_system.u_ro.addr_s2 : std_logic_vector(ADDR_W - 1 downto 0) >>;
     constant T_ADDR : natural := HOLD_LO / LANES;
     constant T_LANE : natural := HOLD_LO mod LANES;
+    constant W2_BIT : natural := HOLD_LO + 3;           -- HOLD(3): in another address
+    constant T2_ADDR : natural := W2_BIT / LANES;
     variable seen : natural := 0;
     variable errors : natural := 0;
-    variable soft_events, soft_seen : natural := 0;
-    variable a : natural;
+    variable idx, from, n : natural;
+    variable seed1 : positive := 11;
+    variable seed2 : positive := 73;
+    variable r : real;
+    variable lane_bit : std_logic_vector(7 downto 0);
+
+    function u8(v : natural) return std_logic_vector is
+    begin
+      return std_logic_vector(to_unsigned(v, 8));
+    end function;
 
     procedure send(c : std_logic_vector(7 downto 0)) is
     begin
@@ -201,8 +219,8 @@ begin
     end procedure;
 
     -- wait for the next frame of type t (skipping others); returns its index
-    procedure expect(t : std_logic_vector(7 downto 0); variable idx : out natural;
-                     limit : time := 200 us) is
+    procedure expect(t : std_logic_vector(7 downto 0); variable i : out natural;
+                     limit : time := 500 us) is
       variable deadline : time;
     begin
       deadline := now + limit;
@@ -210,33 +228,37 @@ begin
         while seen < n_frames loop
           seen := seen + 1;
           if f_type(seen - 1) = to_integer(unsigned(t)) then
-            idx := seen - 1;
+            i := seen - 1;
             return;
           end if;
         end loop;
         wait on n_frames for deadline - now;
         if now >= deadline then
           fail("no frame of type " & integer'image(to_integer(unsigned(t))));
-          idx := 1023;
+          i := NO_FRAME;
           return;
         end if;
       end loop;
     end procedure;
 
-    -- frames of type t received from index from on
-    impure function count(t : std_logic_vector(7 downto 0); from : natural) return natural is
-      variable n : natural := 0;
+    procedure acked(c : std_logic_vector(7 downto 0)) is
+      variable i : natural;
     begin
-      for i in from to n_frames - 1 loop
+      send(c);
+      expect(FT_ACK, i);
+    end procedure;
+
+    impure function count(t : std_logic_vector(7 downto 0); first : natural) return natural is
+      variable k : natural := 0;
+    begin
+      for i in first to n_frames - 1 loop
         if f_type(i) = to_integer(unsigned(t)) then
-          n := n + 1;
+          k := k + 1;
         end if;
       end loop;
-      return n;
+      return k;
     end function;
 
-    -- an event's address and the masks of replica A in both samples
-    -- (payload: addr(1) sweep(4) a1 b1 c1 a2 b2 c2, one byte each here)
     function u16(hi, lo : std_logic_vector(7 downto 0)) return natural is
       variable w : std_logic_vector(15 downto 0);
     begin
@@ -244,29 +266,77 @@ begin
       return to_integer(unsigned(w));
     end function;
 
+    -- SOFT/CONFIG payload: addr(1) sweep(4) a1 b1 c1 a2 b2 c2 echo(1)
     impure function ev_addr(i : natural) return natural is
     begin
       return to_integer(unsigned(f_pay(i)(0)));
     end function;
-    impure function ev_mask(i : natural; m : natural) return std_logic_vector is
+    impure function ev_mask(i, m : natural) return std_logic_vector is
     begin
       return f_pay(i)(5 + m);
     end function;
 
-    procedure wait_sweeps(n : natural) is
-      variable k : natural;
+    -- a flip of replica A's HOLD(b), from now to the next design clock edge
+    procedure flip(b : natural) is
     begin
-      for i in 1 to n loop
-        wait until ro_addr = std_logic_vector(to_unsigned(NUM_ADDR - 1, ADDR_W));
-        wait until ro_addr = std_logic_vector(to_unsigned(0, ADDR_W));
+      hold(b) <= force not hold(b);
+      wait until rising_edge(w_dclk);
+      wait for 1 ns;
+      hold(b) <= release;
+    end procedure;
+
+    -- k flips at random times, far enough apart for their frames to get out
+    procedure flips(b, k : natural) is
+    begin
+      for i in 1 to k loop
+        uniform(seed1, seed2, r);
+        wait for 40 us + r * 20 us;
+        flip(b);
+      end loop;
+      wait for 100 us;                    -- let the last frames arrive
+    end procedure;
+
+    -- seen flips against k * p, within 4 sigma
+    procedure rate(name : string; got, k : natural; p : real) is
+      constant m : real := real(k) * p;
+    begin
+      report name & ": " & integer'image(k) & " flips, " & integer'image(got) & " seen, expected "
+             & integer'image(integer(m)) & " (P = " & real'image(p) & ")";
+      if abs (real(got) - m) > 4.0 * sqrt(m * (1.0 - p)) then
+        fail(name & ": detection rate does not match the formula");
+      end if;
+    end procedure;
+
+    -- events from first on: none a configuration error, all at address a, lane
+    -- as given, replica A only, no bad echoes
+    procedure check_events(first, a : natural; lb : std_logic_vector(7 downto 0)) is
+    begin
+      for i in first to n_frames - 1 loop
+        if f_type(i) = to_integer(unsigned(FT_CONFIG)) then
+          fail("a flip was taken for a configuration error");
+        elsif f_type(i) = to_integer(unsigned(FT_SOFT)) then
+          if ev_addr(i) /= a then
+            fail("flip-flop error at address " & integer'image(ev_addr(i)));
+          end if;
+          if (ev_mask(i, 0) or ev_mask(i, 3)) /= lb or
+             (ev_mask(i, 1) or ev_mask(i, 2) or ev_mask(i, 4) or ev_mask(i, 5)) /= x"00" then
+            fail("flip-flop error masks");
+          end if;
+          if f_pay(i)(11) /= x"00" then
+            fail("bad echo marked on an event");
+          end if;
+        end if;
       end loop;
     end procedure;
 
-    variable idx, from : natural;
-    variable seed1 : positive := 11;
-    variable seed2 : positive := 73;
-    variable r : real;
-    variable lane_bit : std_logic_vector(7 downto 0);
+    type pass_t is array (1 to LMAX, 0 to TAPS - 1) of std_logic_vector(LINES - 1 downto 0);
+    variable pass : pass_t;
+    type tap_t is array (0 to LINES - 1) of natural;
+    variable best_tap : tap_t;
+    variable best_l, best_score : natural := 0;
+    variable score, run_len, top, top_at : natural;
+    variable this_tap : tap_t;
+    variable t0 : time;
   begin
     lane_bit := (others => '0');
     lane_bit(T_LANE) := '1';
@@ -275,137 +345,196 @@ begin
     rst_n <= '1'; rst_dut <= '1';
     wait for 1 us;
 
-    -- 1. INFO, CLEAR, START
+    -- 1. INFO and the ratio
     send(CMD_INFO);
     expect(FT_INFO, idx);
-    if idx < 1023 then
-      if u16(f_pay(idx)(1), f_pay(idx)(2)) /= LANES or
-         to_integer(unsigned(f_pay(idx)(7))) /= NUM_ADDR then
+    if idx /= NO_FRAME then
+      if u16(f_pay(idx)(1), f_pay(idx)(2)) /= LANES or to_integer(unsigned(f_pay(idx)(7))) /= NUM_ADDR
+         or to_integer(unsigned(f_pay(idx)(8))) /= GUARD or to_integer(unsigned(f_pay(idx)(11))) /= TAPS
+         or to_integer(unsigned(f_pay(idx)(12))) /= LMAX or u16(f_pay(idx)(13), f_pay(idx)(14)) /= 8 then
         fail("INFO contents");
       end if;
     end if;
+    send(CMD_RATIO); send(x"00"); send(x"00"); send(x"05");
+    expect(FT_ACK, idx);
+    wait for 1 us;
+    wait until rising_edge(w_dclk);
+    t0 := now;
+    wait until rising_edge(w_dclk);
+    if now - t0 /= 100 ns then
+      fail("design clock period with ratio 5: " & time'image(now - t0));
+    end if;
+    send(CMD_RATIO); send(x"00"); send(x"00"); send(x"01");
+    expect(FT_NACK, idx);
+    send(CMD_RATIO); send(x"00"); send(x"00"); send(u8(RATIO));
+    expect(FT_ACK, idx);
+    wait for 1 us;
+    wait until rising_edge(w_dclk);
+    t0 := now;
+    wait until rising_edge(w_dclk);
+    if now - t0 /= RATIO * 20 ns then
+      fail("design clock period with ratio 8: " & time'image(now - t0));
+    end if;
+
+    -- 2. uncalibrated: a wrong latency shows in the echoes
+    send(CMD_LAT); send(x"0E");
+    expect(FT_ACK, idx);
+    acked(CMD_START);
+    send(CMD_RATIO); send(x"00"); send(x"00"); send(u8(RATIO));
+    expect(FT_NACK, idx);
+    wait for 40 us;
+    send(CMD_STATUS);
+    expect(FT_STATUS, idx);
+    if idx /= NO_FRAME and f_pay(idx)(1) & f_pay(idx)(2) & f_pay(idx)(3) & f_pay(idx)(4) = x"00000000" then
+      fail("no bad echoes at a wrong latency");
+    end if;
+    acked(CMD_STOP);
+    wait for 50 us;
+    seen := n_frames;
+
+    -- 3. calibration: what em_host.py does
+    for l in 1 to LMAX loop
+      send(CMD_LAT); send(u8(l));
+      expect(FT_ACK, idx);
+      for t in 0 to TAPS - 1 loop
+        send(CMD_TAP); send(x"FF"); send(u8(t));
+        expect(FT_ACK, idx);
+        send(CMD_TRAIN);
+        expect(FT_TRAIN, idx);
+        pass(l, t) := f_pay(idx)(3)(2 downto 0) & f_pay(idx)(2)(LANES - 1 downto 0)
+                      & f_pay(idx)(1)(LANES - 1 downto 0) & f_pay(idx)(0)(LANES - 1 downto 0);
+      end loop;
+    end loop;
+    for l in 1 to LMAX loop
+      score := TAPS + 1;
+      for line in 0 to LINES - 1 loop
+        top := 0; top_at := 0; run_len := 0;
+        for t in 0 to TAPS - 1 loop
+          if pass(l, t)(line) = '1' then
+            run_len := run_len + 1;
+            if run_len > top then
+              top := run_len;
+              top_at := t;
+            end if;
+          else
+            run_len := 0;
+          end if;
+        end loop;
+        this_tap(line) := top_at - top / 2;
+        if top = 0 then
+          this_tap(line) := 0;
+        end if;
+        if top < score then
+          score := top;
+        end if;
+      end loop;
+      if score > best_score then
+        best_score := score;
+        best_l := l;
+        best_tap := this_tap;
+      end if;
+    end loop;
+    report "calibration: latency " & integer'image(best_l) & ", narrowest eye "
+           & integer'image(best_score) & " taps";
+    if best_score = 0 then
+      fail("calibration found no latency that passes");
+    else
+      send(CMD_LAT); send(u8(best_l));
+      expect(FT_ACK, idx);
+      for line in 0 to LINES - 1 loop
+        send(CMD_TAP); send(u8(line)); send(u8(best_tap(line)));
+        expect(FT_ACK, idx);
+      end loop;
+      send(CMD_TRAIN);
+      expect(FT_TRAIN, idx);
+      if f_pay(idx)(0)(3 downto 0) /= x"F" or f_pay(idx)(1)(3 downto 0) /= x"F"
+         or f_pay(idx)(2)(3 downto 0) /= x"F" or f_pay(idx)(3)(2 downto 0) /= "111" then
+        fail("training does not pass at the calibrated settings");
+      end if;
+    end if;
+
     send(CMD_CLEAR);
     expect(FT_ACK, idx);
     expect(FT_CLEARED, idx);
-    send(CMD_START);
-    expect(FT_ACK, idx);
-    wait_sweeps(3);
-    if count(FT_SOFT, 0) + count(FT_CONFIG, 0) /= 0 then
+    from := n_frames;
+    acked(CMD_START);
+    send(CMD_CLEAR);
+    expect(FT_NACK, idx);
+    wait for 40 us;
+    if count(FT_SOFT, from) + count(FT_CONFIG, from) /= 0 then
       fail("errors reported by a fault-free design");
     end if;
-
-    -- 2. one-cycle flips, at every offset across a visit of the target address
-    from := n_frames;
-    for offset in 0 to SETTLE + 6 loop
-      wait until ro_addr = std_logic_vector(to_unsigned(T_ADDR, ADDR_W));
-      for i in 1 to offset loop
-        wait until rising_edge(dclk);
-      end loop;
-      wait for 1 ns;                       -- just after the edge
-      hold(0) <= force not hold(0);
-      wait until rising_edge(dclk);
-      wait for 1 ns;
-      hold(0) <= release;
-      wait_sweeps(2);
-    end loop;
-    wait for 100 us;                       -- let the last frames arrive
-    for i in from to n_frames - 1 loop
-      if f_type(i) = to_integer(unsigned(FT_CONFIG)) then
-        fail("a one-cycle flip was taken for a configuration error");
-      elsif f_type(i) = to_integer(unsigned(FT_SOFT)) then
-        soft_events := soft_events + 1;
-        if ev_addr(i) /= T_ADDR then
-          fail("flip-flop error at address " & integer'image(ev_addr(i)));
-        end if;
-        -- replica A, sample 1 or sample 2, exactly the target lane
-        if (ev_mask(i, 0) or ev_mask(i, 3)) /= lane_bit or
-           (ev_mask(i, 1) or ev_mask(i, 2) or ev_mask(i, 4) or ev_mask(i, 5)) /= x"00" then
-          fail("flip-flop error masks");
-        end if;
-      end if;
-    end loop;
-    report "one-cycle flips: " & integer'image(SETTLE + 7) & " injected, "
-           & integer'image(soft_events) & " seen as flip-flop errors";
-    if soft_events = 0 then
-      fail("no one-cycle flip was seen");
+    send(CMD_STATUS);
+    expect(FT_STATUS, idx);
+    if f_pay(idx)(0)(2) /= '1' or f_pay(idx)(1) & f_pay(idx)(2) & f_pay(idx)(3) & f_pay(idx)(4) /= x"00000000"
+       or f_pay(idx)(5) & f_pay(idx)(6) & f_pay(idx)(7) & f_pay(idx)(8) /= x"00000000"
+       or f_pay(idx)(9) & f_pay(idx)(10) & f_pay(idx)(11) & f_pay(idx)(12) /= x"00000000" then
+      fail("bad echoes after calibration");
     end if;
 
-    -- 2b. the correction factor: one-cycle flips at random times are seen with
-    -- probability 2 / (NUM_ADDR * (SETTLE + 4)), which host/em_host.py divides by
+    -- 4. random flips, in a sweep of 2 windows of 7: T_ADDR at phase GUARD + T_ADDR
     from := n_frames;
-    for k in 1 to RANDOM_FLIPS loop
-      uniform(seed1, seed2, r);
-      for i in 1 to 61 + integer(trunc(r * 120.0)) loop
-        wait until rising_edge(dclk);
-      end loop;
-      wait for 1 ns;
-      hold(0) <= force not hold(0);
-      wait until rising_edge(dclk);
-      wait for 1 ns;
-      hold(0) <= release;
-    end loop;
-    wait for 100 us;
-    report "random flips: " & integer'image(RANDOM_FLIPS) & " injected, "
-           & integer'image(count(FT_SOFT, from)) & " seen, expected "
-           & integer'image(RANDOM_FLIPS * 2 / (NUM_ADDR * (SETTLE + 4)));
-    if abs (real(count(FT_SOFT, from)) - real(RANDOM_FLIPS) * 2.0 / real(NUM_ADDR * (SETTLE + 4)))
-       > 4.0 * sqrt(real(RANDOM_FLIPS) * 2.0 / real(NUM_ADDR * (SETTLE + 4))) then
-      fail("detection rate does not match the correction factor");
-    end if;
-    if count(FT_CONFIG, from) /= 0 then
-      fail("a random one-cycle flip was taken for a configuration error");
-    end if;
+    seen := n_frames;
+    flips(0, RANDOM_FLIPS);
+    rate("sweep", count(FT_SOFT, from), RANDOM_FLIPS,
+         (real(GUARD + T_ADDR) + 0.5) / real(RATIO) / 2.0);
+    check_events(from, T_ADDR, lane_bit);
 
-    -- 3. a flip that stays: configuration error, halt, resume
+    -- 5. a flip that stays: configuration error, halt, resume
     from := n_frames;
+    seen := n_frames;
     hold(0) <= force not hold(0);
-    expect(FT_CONFIG, idx, 200 us);
-    if idx < 1023 then
+    expect(FT_CONFIG, idx);
+    if idx /= NO_FRAME then
       if ev_addr(idx) /= T_ADDR or ev_mask(idx, 0) /= lane_bit or ev_mask(idx, 3) /= lane_bit then
         fail("configuration error place");
       end if;
     end if;
     send(CMD_STATUS);
     expect(FT_STATUS, idx);
-    if idx < 1023 and f_pay(idx)(0)(1) /= '1' then
+    if idx /= NO_FRAME and f_pay(idx)(0)(1) /= '1' then
       fail("not halted after a configuration error");
     end if;
-    wait for 5 us;
+    wait for 20 us;
     if count(FT_CONFIG, from) /= 1 then
       fail("configuration error reported more than once while halted");
     end if;
     hold(0) <= release;                    -- the host reconfigures the FPGA
+    wait for 1 us;
     send(CMD_RESUME);
     expect(FT_ACK, idx);
     from := n_frames;
-    wait_sweeps(3);
+    wait for 40 us;
     if count(FT_SOFT, from) + count(FT_CONFIG, from) /= 0 then
       fail("errors after resume");
     end if;
 
-    -- 4. counter dump against the events. A held flip can show in one sample
-    -- of a visit before it shows in both, so it may add flip-flop errors too:
-    -- compare with every flip-flop error event received.
-    send(CMD_STOP);
-    expect(FT_ACK, idx);
-    wait for 50 us;
-    soft_events := count(FT_SOFT, 0);
+    -- 6. counter dump against the events since the clear
+    acked(CMD_STOP);
+    wait for 100 us;
+    n := 0;
+    from := 0;
+    for i in 0 to n_frames - 1 loop
+      if f_type(i) = to_integer(unsigned(FT_CLEARED)) then
+        from := i;
+      end if;
+    end loop;
+    n := count(FT_SOFT, from);
     from := n_frames;
+    seen := n_frames;
     send(CMD_DUMP);
-    expect(FT_DUMPEND, idx, 100 us);
+    expect(FT_DUMPEND, idx, 1 ms);
     for i in from to n_frames - 1 loop
       if f_type(i) = to_integer(unsigned(FT_COUNTER)) then
-        a := ev_addr(i);
-        if a = T_ADDR then
-          if u16(f_pay(i)(1), f_pay(i)(2)) /= soft_events then
-            fail("soft counter " & integer'image(u16(f_pay(i)(1), f_pay(i)(2)))
-                 & " /= " & integer'image(soft_events));
+        if ev_addr(i) = T_ADDR then
+          if u16(f_pay(i)(1), f_pay(i)(2)) /= n then
+            fail("soft counter " & integer'image(u16(f_pay(i)(1), f_pay(i)(2))) & " /= " & integer'image(n));
           end if;
           if to_integer(unsigned(f_pay(i)(3))) /= 1 then
             fail("configuration counter");
           end if;
         elsif f_pay(i)(1) /= x"00" or f_pay(i)(2) /= x"00" or f_pay(i)(3) /= x"00" then
-          fail("counter at address " & integer'image(a));
+          fail("counter at address " & integer'image(ev_addr(i)));
         end if;
       end if;
     end loop;
@@ -413,20 +542,56 @@ begin
       fail("dump has " & integer'image(count(FT_COUNTER, from)) & " counters");
     end if;
 
-    -- 5. the forwarded clock stops and comes back
-    send(CMD_START);
+    -- 7. a list of three addresses, T_ADDR in the middle (not T2_ADDR)
+    send(CMD_LIST); send(x"00"); send(x"03");
+    send(u8(2)); send(u8(T_ADDR)); send(u8(7));
+    expect(FT_ACK, idx);
+    send(CMD_MODE); send(x"01");
     expect(FT_ACK, idx);
     from := n_frames;
-    dclk_run <= false;
-    expect(FT_CLOCK, idx, 100 us);
-    if idx < 1023 and f_pay(idx)(0) /= x"00" then
-      fail("clock loss not reported");
+    seen := n_frames;
+    acked(CMD_START);
+    flips(0, 200);
+    rate("list", count(FT_SOFT, from), 200, (real(RATIO - 3 + 1) + 0.5) / real(RATIO));
+    check_events(from, T_ADDR, lane_bit);
+    from := n_frames;
+    flips(3, 50);                          -- a bit the list does not read
+    if count(FT_SOFT, from) /= 0 then
+      fail("an address not on the list was reported");
     end if;
-    dclk_run <= true;
-    expect(FT_CLOCK, idx, 100 us);
-    if idx < 1023 and f_pay(idx)(0) /= x"01" then
-      fail("clock return not reported");
+    -- a list of one: the fixed-address mode
+    acked(CMD_STOP);
+    wait for 50 us;
+    send(CMD_LIST); send(x"00"); send(x"01");
+    send(u8(T2_ADDR));
+    expect(FT_ACK, idx);
+    from := n_frames;
+    seen := n_frames;
+    acked(CMD_START);
+    flips(3, 80);
+    rate("fixed", count(FT_SOFT, from), 80, (real(RATIO - 1) + 0.5) / real(RATIO));
+    lane_bit := (others => '0');
+    lane_bit(W2_BIT mod LANES) := '1';
+    check_events(from, T2_ADDR, lane_bit);
+    acked(CMD_STOP);
+    wait for 50 us;
+    send(CMD_MODE); send(x"00");
+    expect(FT_ACK, idx);
+
+    -- 8. the readout dies and comes back
+    acked(CMD_START);
+    seen := n_frames;
+    ro_alive <= false;
+    expect(FT_LINK, idx, 200 us);
+    if idx /= NO_FRAME and f_pay(idx)(0) /= x"00" then
+      fail("link loss not reported");
     end if;
+    ro_alive <= true;
+    expect(FT_LINK, idx, 200 us);
+    if idx /= NO_FRAME and f_pay(idx)(0) /= x"01" then
+      fail("link return not reported");
+    end if;
+    acked(CMD_STOP);
 
     if bad_frames /= 0 then
       fail(integer'image(bad_frames) & " malformed frames");

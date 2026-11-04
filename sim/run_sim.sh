@@ -18,11 +18,11 @@ W="$S/work"; mkdir -p "$W"; cd "$W"
 HOLD_LO=$(awk '$2 == "HOLD" { split($1, r, ":"); print (r[2] != "" ? r[2] : r[1]) }' ARESET.tmrdff.map)
 
 rm -rf em; "$Q/vlib" em >/dev/null; : > compile.log
-for f in em_pkg em_uart em_async_fifo em_dpram em_scanner em_host_if em_detector_top tmrdff_readout; do
+for f in em_pkg em_uart em_async_fifo em_dpram em_line_delay em_scanner em_host_if em_detector_top tmrdff_readout; do
   "$Q/vcom" -93 -work em -quiet "$R/hdl/$f.vhd" >> compile.log 2>&1 || { grep Error compile.log; exit 1; }
 done
 "$Q/vcom" -93 -work em -quiet areset_tmr.vhd >> compile.log 2>&1 || { grep Error compile.log; exit 1; }
 "$Q/vcom" -2008 -work em -quiet "$S/tb_em_system.vhd" >> compile.log 2>&1 || { grep Error compile.log; exit 1; }
 "$Q/vsim" -c -lib em tb_em_system -gHOLD_LO="$HOLD_LO" -do "run -all; quit -f" > sim.log 2>&1 || true
-grep -E "one-cycle flips|random flips|CHECK FAILED|TB PASS|TB FAIL|\*\* (Error|Fatal)" sim.log | sed 's/^# //'
+grep -E "calibration:|sweep:|list:|fixed:|CHECK FAILED|TB PASS|TB FAIL|\*\* (Error|Fatal)" sim.log | sed 's/^# //'
 grep -q "TB PASS" sim.log
